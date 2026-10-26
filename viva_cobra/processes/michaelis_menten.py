@@ -18,6 +18,11 @@ from typing import Dict, Mapping, Sequence
 
 from process_bigraph import Process
 
+try:  # contract metadata is optional — never break import if unavailable
+    from bigraph_schema.contract import ProcessContract
+except Exception:  # pragma: no cover - defensive
+    ProcessContract = None
+
 # A tiny epsilon keeps the rate finite and zero at S = 0 (matches CRM_FBA).
 _EPS = 1e-12
 
@@ -41,12 +46,66 @@ def mm_uptake_rates(
 
 
 class MichaelisMentenUptakeProcess(Process):
-    """Temporal uptake Process for a dynamic-FBA composite.
+    """Michaelis-Menten (Monod) uptake — Vₐ = Vmaxₐ·Sₐ/(Kmₐ + Sₐ) per resource.
+
+    Temporal Process in a dynamic-FBA composite: each step it reads the current
+    substrate concentrations, computes a saturating per-resource uptake rate,
+    and emits those rates (plus the scheduling interval) for a downstream
+    ``FBAStep`` to turn into exchange-reaction bounds.
+
+        Vₐ = Vmaxₐ · Sₐ / (Kmₐ + Sₐ)      (mmol / gDW / hr, ≥ 0)
 
     config:
         resources: list of resource names.
         kinetic_params: {resource: [Km, Vmax]} half-saturation + max velocity.
     """
+
+    description = (
+        "Michaelis-Menten (Monod) substrate uptake — a saturating per-resource "
+        "uptake rate Vₐ = Vmaxₐ·Sₐ/(Kmₐ + Sₐ) that rises linearly at low "
+        "substrate and plateaus at Vmaxₐ once Sₐ ≫ Kmₐ.\n"
+        "   Vₐ = Vmaxₐ · Sₐ / (Kmₐ + Sₐ)   (mmol / gDW / hr, ≥ 0); "
+        "concentrations are floored at zero so the rate is 0 at Sₐ = 0."
+    )
+
+    if ProcessContract is not None:
+        contract = ProcessContract(
+            summary=(
+                "Per-resource Michaelis-Menten uptake rate "
+                "Vₐ = Vmaxₐ·Sₐ/(Kmₐ+Sₐ), saturating in substrate, emitted with "
+                "the scheduling interval to drive a downstream FBA step."
+            ),
+            symbols={
+                "Vₐ": "uptake rate of resource a (mmol / gDW / hr, ≥ 0) — the emitted `uptakes[a]`",
+                "Sₐ": "concentration of resource a in the environment (floored at 0)",
+                "Vmaxₐ": "maximum uptake velocity of resource a (mmol / gDW / hr)",
+                "Kmₐ": "half-saturation constant of resource a: Sₐ at which Vₐ = Vmaxₐ/2",
+                "ε": "numerical epsilon (1e-12) keeping the rate finite and exactly 0 at Sₐ = 0",
+                "Δt": "scheduling interval of the Process, echoed as `interval`",
+            },
+            math=[
+                r"V_a = \frac{V^{\max}_a\,S_a}{K^m_a + S_a + \varepsilon}",
+                r"S_a \leftarrow \max(0,\, S_a)",
+                r"\lim_{S_a \to \infty} V_a = V^{\max}_a, \qquad V_a\big|_{S_a = K^m_a} = \tfrac{1}{2}V^{\max}_a",
+            ],
+            inputs={
+                "substrates": "Current environmental concentrations per resource (`map[concentration]`); negative/missing values read as 0.",
+                "biomass": "Current biomass (`mass`); read for composite wiring, not used in the rate law.",
+            },
+            outputs={
+                "uptakes": "Per-resource uptake rates Vₐ (`overwrite[map[float]]`), one entry per configured resource, ≥ 0.",
+                "interval": "The scheduling interval Δt (`overwrite[float]`), echoed so the non-temporal FBA step can convert fluxes to deltas.",
+            },
+            config={
+                "resources": "List of resource names the Process emits uptakes for.",
+                "kinetic_params": "{resource: [Km, Vmax]} — half-saturation constant and maximum velocity per resource; every resource must be present or initialize() raises.",
+            },
+            assumptions=[
+                "Uptake follows single-substrate Michaelis-Menten / Monod kinetics, independent per resource (no competitive coupling).",
+                "Substrate concentrations are floored at zero; the rate is non-negative and 0 at Sₐ = 0.",
+                "Km and Vmax are constant over the simulation (no enzyme regulation or adaptation).",
+            ],
+        )
 
     config_schema = {
         "resources": "list[string]",
