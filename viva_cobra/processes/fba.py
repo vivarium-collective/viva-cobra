@@ -28,6 +28,11 @@ import cobra
 from cobra.io import load_model
 from process_bigraph import Step
 
+try:  # contract metadata is optional — never break import if unavailable
+    from bigraph_schema.contract import ProcessContract
+except Exception:  # pragma: no cover - defensive
+    ProcessContract = None
+
 warnings.filterwarnings("ignore", category=UserWarning, module="cobra.util.solver")
 warnings.filterwarnings("ignore", category=FutureWarning, module="cobra.medium.boundary_types")
 
@@ -85,7 +90,17 @@ def apply_uptake_bounds(model, uptakes: Dict[str, float], substrate_rxns: Dict[s
 
 
 class FBAStep(Step):
-    """Steady-state FBA step for a dynamic-FBA composite.
+    """Steady-state flux-balance analysis as a non-temporal Step.
+
+    Solves the FBA linear program — maximize the biomass objective subject to
+    the steady-state mass-balance S·v = 0 and flux bounds lb ≤ v ≤ ub — with
+    exchange lower bounds set from the incoming uptake rates, then converts the
+    optimal growth rate and exchange fluxes into biomass and substrate deltas
+    over the interval Δt supplied by the upstream temporal Process:
+
+        max  cᵀv   s.t.   S·v = 0,   lb ≤ v ≤ ub      (lb_exch,a = -uₐ)
+        Δbiomass    = μ · biomass · Δt
+        Δsubstrateₐ = vₐ · biomass · Δt   (clamped so the pool stays ≥ 0)
 
     config:
         model_file: SBML filename / path / cobrapy name (e.g. "textbook").
@@ -93,6 +108,67 @@ class FBAStep(Step):
         bounds: {reaction_id: {lower, upper}} static overrides (e.g. O2, ATPM).
         biomass_reaction: objective reaction id (defaults to the model's own).
     """
+
+    description = (
+        "Steady-state flux-balance analysis (FBA) LP: maximize the biomass "
+        "objective cᵀv subject to the mass-balance constraint S·v = 0 and flux "
+        "bounds lb ≤ v ≤ ub, with exchange lower bounds driven by the incoming "
+        "uptake rates (lb = -u). The optimal growth rate μ and exchange fluxes "
+        "are integrated over the interval Δt into biomass and substrate deltas.\n"
+        "   max cᵀv  s.t.  S·v = 0,  lb ≤ v ≤ ub,  lb_exch,a = -uₐ\n"
+        "   Δbiomass = μ·biomass·Δt;   Δsubstrateₐ = vₐ·biomass·Δt (clamped ≥ -pool)."
+    )
+
+    if ProcessContract is not None:
+        contract = ProcessContract(
+            summary=(
+                "Steady-state FBA linear program (max cᵀv s.t. S·v = 0, "
+                "lb ≤ v ≤ ub) with uptake-driven exchange bounds, returning "
+                "biomass and substrate deltas over the step interval."
+            ),
+            symbols={
+                "v": "vector of reaction fluxes (mmol / gDW / hr); the LP decision variables",
+                "S": "stoichiometric matrix Sᵢⱼ (metabolite i × reaction j)",
+                "c": "objective coefficient vector selecting the biomass reaction",
+                "cᵀv": "objective value = growth rate μ of the biomass reaction",
+                "μ": "optimal growth rate = solution.objective_value (1/hr)",
+                "lb": "per-reaction lower flux bounds (uptake direction for exchanges)",
+                "ub": "per-reaction upper flux bounds (secretion direction for exchanges)",
+                "uₐ": "incoming uptake rate of resource a (≥ 0); sets exchange lb_exch,a = -uₐ",
+                "vₐ": "optimal exchange flux of resource a at the solution (signed)",
+                "Δt": "interval over which fluxes are integrated (the input `interval`)",
+                "Δbiomass": "biomass change this step = μ·biomass·Δt",
+                "Δsubstrateₐ": "substrate change = vₐ·biomass·Δt, clamped so the pool stays ≥ 0",
+            },
+            math=[
+                r"\max_{v}\; c^{\mathsf{T}} v \quad \text{s.t.}\quad S\,v = 0,\; \mathrm{lb} \le v \le \mathrm{ub}",
+                r"\mathrm{lb}^{\mathrm{exch}}_a = -u_a,\qquad u_a = \max(0,\, u_a)",
+                r"\mu = c^{\mathsf{T}} v^{\star}, \qquad \Delta\mathrm{biomass} = \mu\,\cdot\,\mathrm{biomass}\,\cdot\,\Delta t",
+                r"\Delta\mathrm{substrate}_a = \max\!\big(v^{\star}_a\,\cdot\,\mathrm{biomass}\,\cdot\,\Delta t,\; -\mathrm{pool}_a\big)",
+            ],
+            inputs={
+                "uptakes": "Per-resource uptake rates uₐ (`map[float]`, ≥ 0); set exchange lower bounds. Also the Step's trigger.",
+                "substrates": "Current substrate pools (`map[concentration]`); used to clamp each delta so no pool goes negative.",
+                "biomass": "Current biomass (`mass`); scales fluxes and growth into absolute deltas.",
+                "interval": "Timestep Δt (`float`) emitted by the upstream temporal Process; deltas are zero when Δt ≤ 0.",
+            },
+            outputs={
+                "substrates": "Per-resource substrate deltas Δsubstrateₐ (`map[count]`), clamped to not exceed the available pool.",
+                "biomass": "Biomass delta Δbiomass = μ·biomass·Δt (`mass`).",
+            },
+            config={
+                "model_file": "SBML filename / absolute path / cobrapy model name (e.g. \"textbook\") for the genome-scale model.",
+                "substrate_update_reactions": "{resource_name: exchange_reaction_id} mapping each tracked resource to its exchange reaction.",
+                "bounds": "{reaction_id: {lower, upper}} static flux-bound overrides applied at load (e.g. O2, ATPM).",
+                "biomass_reaction": "Objective reaction id; defaults to the model's own objective when omitted.",
+            },
+            assumptions=[
+                "Metabolism is at quasi-steady state within each step: S·v = 0 (no net internal metabolite accumulation).",
+                "The LP maximizes a single linear biomass objective; a non-optimal solver status yields zero deltas.",
+                "Uptake rates set only exchange lower bounds (lb = -u); substrate deltas are clamped so pools never go negative.",
+                "Fluxes and growth are constant over the interval Δt (explicit forward-Euler integration of dynamic FBA).",
+            ],
+        )
 
     config_schema = {
         "model_file": "string",
