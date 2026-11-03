@@ -164,7 +164,7 @@ class FBAStep(Step):
             },
             assumptions=[
                 "Metabolism is at quasi-steady state within each step: S·v = 0 (no net internal metabolite accumulation).",
-                "The LP maximizes a single linear biomass objective; a non-optimal solver status yields zero deltas.",
+                "The LP maximizes a single linear biomass objective; a non-optimal solver status raises RuntimeError.",
                 "Uptake rates set only exchange lower bounds (lb = -u); substrate deltas are clamped so pools never go negative.",
                 "Fluxes and growth are constant over the interval Δt (explicit forward-Euler integration of dynamic FBA).",
             ],
@@ -218,7 +218,12 @@ class FBAStep(Step):
         delta_subs = {r: 0.0 for r in self.resources}
         delta_biomass = 0.0
 
-        if solution.status == "optimal" and interval > 0.0:
+        if solution.status != "optimal":
+            # An infeasible or unbounded LP means the uptake bounds are not realisable. Returning zero deltas would
+            # look like a step that ran and grew nothing, so fail loudly instead.
+            raise RuntimeError(f"FBA solve not optimal: status {solution.status!r}")
+
+        if interval > 0.0:
             mu = float(solution.objective_value)
             delta_biomass = mu * biomass * interval
 
