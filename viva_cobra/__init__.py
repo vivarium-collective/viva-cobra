@@ -38,4 +38,4 @@ __all__ = [
     "get_model_spec",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"

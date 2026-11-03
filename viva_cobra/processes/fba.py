@@ -12,13 +12,16 @@ Coupling (the dynamic-FBA contract):
     realized flux v_a               -> delta_substrate = v_a * biomass * dt
     growth rate mu                  -> delta_biomass    = mu  * biomass * dt
 
-Substrate deltas are clamped to the available mass (no negative pools).
+Substrate deltas are clamped to the available mass (no negative pools). A step
+whose uptakes are too small to meet the model's fixed demands (e.g. ATPM) is
+starved: it returns zero deltas instead of raising (see ``FBAStep``).
 
 Extracted from CRM_FBA (``crm_dfba/processes/fba.py``); the three module-level
 helpers are framework-agnostic and usable without process-bigraph.
 """
 from __future__ import annotations
 
+import logging
 import os
 import warnings
 from pathlib import Path
@@ -35,6 +38,8 @@ except Exception:  # pragma: no cover - defensive
 
 warnings.filterwarnings("ignore", category=UserWarning, module="cobra.util.solver")
 warnings.filterwarnings("ignore", category=FutureWarning, module="cobra.medium.boundary_types")
+
+logger = logging.getLogger(__name__)
 
 # Bundled SBML GEMs live next to viva_cobra/models/.
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
@@ -102,6 +107,18 @@ class FBAStep(Step):
         Δbiomass    = μ · biomass · Δt
         Δsubstrateₐ = vₐ · biomass · Δt   (clamped so the pool stays ≥ 0)
 
+    Starvation: when the substrates run out, as at the end of a batch culture,
+    the uptakes fall below what the model's fixed demands (e.g. the ATPM lower
+    bound) need, and the LP is infeasible. If the same LP is feasible with
+    every tracked exchange opened to COBRApy's default bound
+    (``cobra.Configuration().lower_bound``), the infeasibility is the substrate
+    supply alone: the step is starved and returns zero deltas, no growth and no
+    consumption, logged at debug level. An LP that stays infeasible with the
+    supply open contradicts itself, and that, like any other non-optimal status
+    (unbounded, ...), raises RuntimeError. A fixed demand set higher than the
+    upstream kinetics can ever supply (e.g. ATPM above what Vmax allows) is the
+    same LP fact as starvation, so it too shows as a run that never grows.
+
     config:
         model_file: SBML filename / path / cobrapy name (e.g. "textbook").
         substrate_update_reactions: {resource_name: exchange_reaction_id}.
@@ -164,7 +181,11 @@ class FBAStep(Step):
             },
             assumptions=[
                 "Metabolism is at quasi-steady state within each step: S·v = 0 (no net internal metabolite accumulation).",
-                "The LP maximizes a single linear biomass objective; a non-optimal solver status raises RuntimeError.",
+                "The LP maximizes a single linear biomass objective; a non-optimal solver status raises RuntimeError, "
+                "except starvation (below).",
+                "Starvation: an LP infeasible at the given uptakes but feasible with every tracked exchange opened to "
+                "COBRApy's default bound is supply-limited (e.g. the uptake cannot meet ATPM once a substrate runs out); "
+                "the step returns zero deltas (no growth, no consumption) instead of raising.",
                 "Uptake rates set only exchange lower bounds (lb = -u); substrate deltas are clamped so pools never go negative.",
                 "Fluxes and growth are constant over the interval Δt (explicit forward-Euler integration of dynamic FBA).",
             ],
@@ -219,8 +240,11 @@ class FBAStep(Step):
         delta_biomass = 0.0
 
         if solution.status != "optimal":
-            # An infeasible or unbounded LP means the uptake bounds are not realisable. Returning zero deltas would
-            # look like a step that ran and grew nothing, so fail loudly instead.
+            if solution.status == "infeasible" and self._feasible_with_open_supply():
+                logger.debug("FBA starved: uptakes %s cannot meet the model's fixed demands; zero deltas", uptakes)
+                return {"substrates": delta_subs, "biomass": delta_biomass}
+            # Any other non-optimal LP is a defect in the model or its bounds. Returning zero deltas would look like
+            # a step that ran and grew nothing, so fail loudly instead.
             raise RuntimeError(f"FBA solve not optimal: status {solution.status!r}")
 
         if interval > 0.0:
@@ -236,3 +260,11 @@ class FBAStep(Step):
             "substrates": delta_subs,
             "biomass": delta_biomass,
         }
+
+    def _feasible_with_open_supply(self) -> bool:
+        """Whether the LP is feasible with every tracked exchange opened to COBRApy's default bound, i.e. whether
+        its infeasibility comes from the substrate supply alone. The bound changes are reverted on exit."""
+        open_uptake = -float(cobra.Configuration().lower_bound)
+        with self.model:
+            apply_uptake_bounds(self.model, {r: open_uptake for r in self.resources}, self.substrate_rxns)
+            return self.model.optimize().status == "optimal"
