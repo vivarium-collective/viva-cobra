@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "viva-cobra"
-version = "0.1.1"
+version = "0.1.2"
 description = "COBRApy flux-balance analysis as process-bigraph components, with a Michaelis-Menten uptake process and a dynamic-FBA composite."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Eran Agmon" }]
 keywords = ["cobrapy", "flux-balance-analysis", "dynamic-fba", "process-bigraph", "vivarium", "metabolic-modeling"]

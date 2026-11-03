@@ -4,6 +4,8 @@ Integration test — runs real COBRApy optimizations each scheduled step.
 """
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from viva_cobra import run_dfba
@@ -79,16 +81,70 @@ def test_first_fba_solve_is_optimal_and_grows_biomass():
     assert out["substrates"]["glucose"] < 0.0
 
 
-def test_non_optimal_solve_raises_instead_of_returning_zero_deltas():
-    """Regression: an infeasible LP used to return zero deltas silently, hiding the defect above."""
+def test_batch_runs_past_glucose_exhaustion_and_stops_growing():
+    """Regression (0.1.1): running out of glucose is the normal end of a batch culture, but the step after it made the
+    LP infeasible (the uptake can no longer cover ATPM >= 1) and FBAStep raised. With this CONFIG glucose runs out at
+    step 114 of dt 0.05; 160 steps runs well past it."""
+    history = run_dfba(
+        CONFIG,
+        initial_substrates={"glucose": 11.1, "acetate": 0.0},
+        initial_biomass=0.01,
+        steps=160,
+        dt=0.05,
+    )
+    assert len(history) == 161
+    assert history[-1]["substrates"]["glucose"] == pytest.approx(0.0, abs=1e-3)
+    tail = [step["biomass"] for step in history[-30:]]
+    assert max(tail) == pytest.approx(min(tail), rel=0, abs=0.0)
+    assert history[-1]["biomass"] > 1.0
+
+
+def _fba_step(config=CONFIG):
     from viva_cobra.core import build_core
     from viva_cobra.processes.fba import FBAStep
 
-    step = FBAStep(config=CONFIG, core=build_core())
+    return FBAStep(config=config, core=build_core())
+
+
+@pytest.mark.parametrize(
+    "glucose_uptake",
+    [
+        0.0,
+        # the uptake of the step that raised in 0.1.1: positive, but below what ATPM >= 1 needs
+        0.0016270804105548392,
+    ],
+)
+def test_substrate_limited_solve_returns_zero_deltas(glucose_uptake, caplog):
+    caplog.set_level(logging.DEBUG, logger="viva_cobra.processes.fba")
+    out = _fba_step().update(
+        {
+            "uptakes": {"glucose": glucose_uptake, "acetate": 0.0},
+            "substrates": {"glucose": 8.1e-5, "acetate": 0.0},
+            "biomass": 1.02,
+            "interval": 0.05,
+        }
+    )
+    assert out == {"substrates": {"glucose": 0.0, "acetate": 0.0}, "biomass": 0.0}
+    assert [r.levelno for r in caplog.records if "starved" in r.getMessage()] == [logging.DEBUG]
+
+
+def test_infeasible_solve_that_more_substrate_cannot_fix_raises():
+    """Regression: a contradictory model used to return zero deltas silently. A growth floor no supply can meet is
+    infeasible at any uptake, so it is a defect in the model, not starvation."""
+    from viva_cobra.processes.fba import _load_fba_model, apply_uptake_bounds
+
+    bounds = {**CONFIG["bounds"], "Biomass_Ecoli_core": {"lower": 500.0, "upper": 1000.0}}
+    # the premise: infeasible at a non-zero uptake, and still infeasible with every tracked exchange fully open
+    model = _load_fba_model("textbook", bounds)
+    for uptake in (10.0, 1000.0):
+        apply_uptake_bounds(model, {"glucose": uptake, "acetate": uptake}, CONFIG["substrate_update_reactions"])
+        assert model.optimize().status == "infeasible"
+
+    step = _fba_step({**CONFIG, "bounds": bounds})
     with pytest.raises(RuntimeError, match="not optimal"):
         step.update(
             {
-                "uptakes": {"glucose": 0.0, "acetate": 0.0},
+                "uptakes": {"glucose": 10.0, "acetate": 0.0},
                 "substrates": {"glucose": 11.1, "acetate": 0.0},
                 "biomass": 0.01,
                 "interval": 0.05,
