@@ -104,10 +104,15 @@ def dfba_document(
     """A complete, runnable dFBA document (two processes + shared stores + emitter)."""
     from process_bigraph.emitter import emitter_from_wires
 
+    from viva_cobra.processes.michaelis_menten import mm_uptake_rates
+
+    resources = list(initial_substrates)
+    substrates = {k: float(v) for k, v in initial_substrates.items()}
     state = {
-        "substrates": {k: float(v) for k, v in initial_substrates.items()},
+        "substrates": substrates,
         "biomass": float(initial_biomass),
-        "uptakes": {r: 0.0 for r in initial_substrates},
+        # the rates the first step runs at; zero would set every exchange lower bound to 0 and make the LP infeasible
+        "uptakes": mm_uptake_rates(substrates, config["kinetic_params"], resources),
         "interval": float(dt),
         "emitter": emitter_from_wires(
             {

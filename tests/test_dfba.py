@@ -45,3 +45,52 @@ def test_model_registry_ecoli_core_metadata():
     assert spec["model_file"] == "textbook"
     assert spec["biomass_reaction"] == "Biomass_Ecoli_core"
     assert "glucose" in spec["substrate_update_reactions"]
+
+
+def test_initial_uptakes_follow_michaelis_menten_not_zero():
+    """Regression: the composite used to start with every uptake at 0. Glucose's exchange lower bound is then 0,
+    which with the ATPM lower bound of 1 makes the first LP infeasible, so the first step grew nothing."""
+    from viva_cobra import dfba_document
+    from viva_cobra.processes.michaelis_menten import mm_uptake_rates
+
+    substrates = {"glucose": 11.1, "acetate": 0.0}
+    doc = dfba_document(CONFIG, dt=0.05, initial_substrates=substrates, initial_biomass=0.01)
+    expected = mm_uptake_rates(substrates, CONFIG["kinetic_params"], ["glucose", "acetate"])
+    assert doc["state"]["uptakes"] == pytest.approx(expected)
+    assert doc["state"]["uptakes"]["glucose"] > 0.0
+
+
+def test_first_fba_solve_is_optimal_and_grows_biomass():
+    from viva_cobra.core import build_core
+    from viva_cobra.processes.fba import FBAStep
+    from viva_cobra.processes.michaelis_menten import mm_uptake_rates
+
+    substrates = {"glucose": 11.1, "acetate": 0.0}
+    step = FBAStep(config=CONFIG, core=build_core())
+    out = step.update(
+        {
+            "uptakes": mm_uptake_rates(substrates, CONFIG["kinetic_params"], ["glucose", "acetate"]),
+            "substrates": substrates,
+            "biomass": 0.01,
+            "interval": 0.05,
+        }
+    )
+    assert out["biomass"] > 0.0
+    assert out["substrates"]["glucose"] < 0.0
+
+
+def test_non_optimal_solve_raises_instead_of_returning_zero_deltas():
+    """Regression: an infeasible LP used to return zero deltas silently, hiding the defect above."""
+    from viva_cobra.core import build_core
+    from viva_cobra.processes.fba import FBAStep
+
+    step = FBAStep(config=CONFIG, core=build_core())
+    with pytest.raises(RuntimeError, match="not optimal"):
+        step.update(
+            {
+                "uptakes": {"glucose": 0.0, "acetate": 0.0},
+                "substrates": {"glucose": 11.1, "acetate": 0.0},
+                "biomass": 0.01,
+                "interval": 0.05,
+            }
+        )
