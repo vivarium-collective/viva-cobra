@@ -238,16 +238,17 @@ def test_one_interval_follows_michaelis_menten_uptake_biomass_and_interval():
 
 
 def test_a_short_pool_caps_the_uptake_so_growth_matches_what_it_supplied():
-    """Glucose 0.1 can supply at most 0.1 over an interval of 1.0 at biomass 1.0, far below the kinetic uptake of 10.
-    The uptake is capped at pool / (biomass x interval) = 0.1 before the solve, so the growth rate is COBRApy's optimum
-    at an exchange of -0.1 and the pool ends at zero, not below it. (ATPM's lower bound is 0 here, so a small uptake is
-    feasible rather than starved.)"""
+    """Glucose 0.1 over an interval of 0.25 at biomass 2.0 can supply an uptake of at most 0.1 / (2.0 x 0.25) = 0.2,
+    far below the kinetic uptake of 10. The uptake is capped at that before the solve, so the growth rate is COBRApy's
+    optimum at an exchange of -0.2 and the pool ends at zero. Biomass, interval and their product all differ from 1,
+    so a cap that dropped either factor (0.1, 0.4 or 0.05) would grow differently. (ATPM's lower bound is 0 here, so a
+    small uptake is feasible rather than starved.)"""
     atpm_free = {**TEXTBOOK, "bounds": {"ATPM": {"lower": 0.0, "upper": 1000.0}}}
-    mu = _textbook_optimum(0.1, atpm_lower=0.0)
-    assert 0.0 < mu < _textbook_optimum(10.0, atpm_lower=0.0)  # the premise: the cap changes the growth
+    mu = _textbook_optimum(0.2, atpm_lower=0.0)
+    assert len({mu, *(_textbook_optimum(u, atpm_lower=0.0) for u in (0.1, 0.4, 0.05))}) == 4  # the premise
     config = {**atpm_free, "kinetic_params": {"glucose": [0.0, 10.0]}}
-    rows = _run_process(config, {"glucose": 0.1}, 1.0, steps=1, dt=1.0)
-    assert rows[-1]["biomass"] == pytest.approx(1.0 + mu, rel=1e-12, abs=0)
+    rows = _run_process(config, {"glucose": 0.1}, 2.0, steps=1, dt=0.25)
+    assert rows[-1]["biomass"] == pytest.approx(2.0 + mu * 2.0 * 0.25, rel=1e-12, abs=0)
     assert rows[-1]["substrates"]["glucose"] == pytest.approx(0.0, abs=1e-12)
 
 
@@ -259,6 +260,29 @@ def test_a_negative_pool_supplies_nothing_and_is_not_refilled():
     rows = _run_process(config, {"glucose": -1.0}, 1.0, steps=1, dt=1.0)
     assert rows[-1]["substrates"]["glucose"] == -1.0
     assert rows[-1]["biomass"] == pytest.approx(1.0, abs=1e-12)
+
+
+def test_fba_step_takes_nothing_from_a_negative_pool_whatever_uptake_it_is_given():
+    """FBAStep's uptake comes from upstream and can be positive whatever the pool holds (the Process's own kinetics
+    already give 0 at a negative concentration). A pool below zero still supplies nothing: no growth, no change."""
+    from viva_cobra.core import build_core
+    from viva_cobra.processes.fba import FBAStep
+
+    config = {**TEXTBOOK, "bounds": {"ATPM": {"lower": 0.0, "upper": 1000.0}}}
+    out = FBAStep(config=config, core=build_core()).update(
+        {"uptakes": {"glucose": 10.0}, "substrates": {"glucose": -1.0}, "biomass": 1.0, "interval": 1.0}
+    )
+    assert out == {"substrates": {"glucose": 0.0}, "biomass": 0.0}
+
+
+def test_growth_over_a_batch_does_not_depend_on_the_step_size():
+    """Over a whole batch to glucose exhaustion, the final biomass at dt 0.5 is within 0.5% of the final biomass at
+    dt 0.05. Without the supply cap a step consumes more than the pool holds and is credited the growth anyway, so the
+    coarse run ends about 1.6% higher."""
+    substrates, biomass = {"glucose": 11.1, "acetate": 0.0}, 0.01
+    fine = _run_process(CONFIG, substrates, biomass, steps=140, dt=0.05)[-1]["biomass"]
+    coarse = _run_process(CONFIG, substrates, biomass, steps=14, dt=0.5)[-1]["biomass"]
+    assert coarse == pytest.approx(fine, rel=0.005)
 
 
 def test_a_saved_and_reloaded_process_does_not_apply_its_deltas_again(tmp_path):
@@ -315,6 +339,11 @@ def test_process_requires_kinetic_params_for_every_resource():
         ([0.5], "must be \\[Km, Vmax\\]"),
         ([0.5, 10.0, 1.0], "must be \\[Km, Vmax\\]"),
         ("fast", "must be \\[Km, Vmax\\]"),
+        ("10", "must be \\[Km, Vmax\\]"),
+        ([True, 10.0], "must be \\[Km, Vmax\\]"),
+        (["0.5", "10"], "must be \\[Km, Vmax\\]"),
+        ({"km": 0.5, "vmax": 10.0}, "must be \\[Km, Vmax\\]"),
+        ({0.5, 10.0}, "must be \\[Km, Vmax\\]"),
         (None, "must be \\[Km, Vmax\\]"),
     ],
 )
@@ -325,3 +354,22 @@ def test_kinetic_params_must_be_a_finite_non_negative_pair(entry, message):
 
     with pytest.raises(ValueError, match=message):
         kinetic_table(["glucose"], {"glucose": entry}, "DynamicFBAProcess")
+
+
+@pytest.mark.parametrize("kinetic_params", [[["glucose", [0.5, 10.0]]], 5])
+def test_kinetic_params_must_be_a_mapping(kinetic_params):
+    from viva_cobra.processes.michaelis_menten import kinetic_table
+
+    with pytest.raises(ValueError, match="kinetic_params must map each resource to \\[Km, Vmax\\]"):
+        kinetic_table(["glucose"], kinetic_params, "DynamicFBAProcess")
+
+
+def test_kinetic_params_accept_numpy_and_tuples():
+    import numpy as np
+
+    from viva_cobra.processes.michaelis_menten import kinetic_table
+
+    table = kinetic_table(
+        ["glucose", "acetate"], {"glucose": np.array([0.5, 10.0]), "acetate": (np.float64(1), 2)}, "Process"
+    )
+    assert table == {"glucose": (0.5, 10.0), "acetate": (1.0, 2.0)}

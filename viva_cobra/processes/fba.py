@@ -184,13 +184,15 @@ class FBAStep(Step):
 
     Solves the FBA linear program — maximize the biomass objective subject to
     the steady-state mass-balance S·v = 0 and flux bounds lb ≤ v ≤ ub — with
-    exchange lower bounds set from the incoming uptake rates, then converts the
-    optimal growth rate and exchange fluxes into biomass and substrate deltas
-    over the interval Δt supplied by the upstream temporal Process:
+    exchange lower bounds set from the incoming uptake rates, each capped at
+    what its pool can supply over the step, then converts the optimal growth
+    rate and exchange fluxes into biomass and substrate deltas over the interval
+    Δt supplied by the upstream temporal Process:
 
+        uₐ ← min(max(0, uₐ), max(0, poolₐ) / (biomass · Δt))   (when biomass · Δt > 0)
         max  cᵀv   s.t.   S·v = 0,   lb ≤ v ≤ ub      (lb_exch,a = -uₐ)
         Δbiomass    = μ · biomass · Δt
-        Δsubstrateₐ = vₐ · biomass · Δt   (clamped so the pool stays ≥ 0)
+        Δsubstrateₐ = max(vₐ · biomass · Δt, -max(0, poolₐ))   (no uptake draws a pool below 0)
 
     Starvation: when the substrates run out, as at the end of a batch culture,
     the uptakes fall below what the model's fixed demands (e.g. the ATPM lower
@@ -215,10 +217,11 @@ class FBAStep(Step):
         "Steady-state flux-balance analysis (FBA) LP: maximize the biomass "
         "objective cᵀv subject to the mass-balance constraint S·v = 0 and flux "
         "bounds lb ≤ v ≤ ub, with exchange lower bounds driven by the incoming "
-        "uptake rates (lb = -u). The optimal growth rate μ and exchange fluxes "
+        "uptake rates (lb = -u), each capped at what its pool can supply over the step. "
+        "The optimal growth rate μ and exchange fluxes "
         "are integrated over the interval Δt into biomass and substrate deltas.\n"
-        "   max cᵀv  s.t.  S·v = 0,  lb ≤ v ≤ ub,  lb_exch,a = -uₐ\n"
-        "   Δbiomass = μ·biomass·Δt;   Δsubstrateₐ = vₐ·biomass·Δt (clamped ≥ -pool)."
+        "   uₐ ← min(uₐ, poolₐ/(biomass·Δt));  max cᵀv  s.t.  S·v = 0,  lb ≤ v ≤ ub,  lb_exch,a = -uₐ\n"
+        "   Δbiomass = μ·biomass·Δt;   Δsubstrateₐ = vₐ·biomass·Δt."
     )
 
     if ProcessContract is not None:
@@ -236,26 +239,32 @@ class FBAStep(Step):
                 "μ": "optimal growth rate = solution.objective_value (1/hr)",
                 "lb": "per-reaction lower flux bounds (uptake direction for exchanges)",
                 "ub": "per-reaction upper flux bounds (secretion direction for exchanges)",
-                "uₐ": "incoming uptake rate of resource a (≥ 0); sets exchange lb_exch,a = -uₐ",
+                "uₐ": "incoming uptake rate of resource a, floored at 0 and capped at poolₐ/(biomass·Δt); "
+                "sets exchange lb_exch,a = -uₐ",
                 "vₐ": "optimal exchange flux of resource a at the solution (signed)",
                 "Δt": "interval over which fluxes are integrated (the input `interval`)",
                 "Δbiomass": "biomass change this step = μ·biomass·Δt",
-                "Δsubstrateₐ": "substrate change = vₐ·biomass·Δt, clamped so the pool stays ≥ 0",
+                "Δsubstrateₐ": "substrate change = vₐ·biomass·Δt; no uptake draws a pool below 0",
             },
             math=[
                 r"\max_{v}\; c^{\mathsf{T}} v \quad \text{s.t.}\quad S\,v = 0,\; \mathrm{lb} \le v \le \mathrm{ub}",
-                r"\mathrm{lb}^{\mathrm{exch}}_a = -u_a,\qquad u_a = \max(0,\, u_a)",
+                r"u_a = \min\!\big(\max(0, u_a),\; \max(0, \mathrm{pool}_a) / (\mathrm{biomass}\,\Delta t)\big),"
+                r"\qquad \mathrm{lb}^{\mathrm{exch}}_a = -u_a",
                 r"\mu = c^{\mathsf{T}} v^{\star}, \qquad \Delta\mathrm{biomass} = \mu\,\cdot\,\mathrm{biomass}\,\cdot\,\Delta t",
-                r"\Delta\mathrm{substrate}_a = \max\!\big(v^{\star}_a\,\cdot\,\mathrm{biomass}\,\cdot\,\Delta t,\; -\mathrm{pool}_a\big)",
+                r"\Delta\mathrm{substrate}_a = \max\!\big(v^{\star}_a\,\cdot\,\mathrm{biomass}\,\cdot\,\Delta t,\;"
+                r" -\max(0, \mathrm{pool}_a)\big)",
             ],
             inputs={
-                "uptakes": "Per-resource uptake rates uₐ (`map[float]`, ≥ 0); set exchange lower bounds. Also the Step's trigger.",
-                "substrates": "Current substrate pools (`map[concentration]`); used to clamp each delta so no pool goes negative.",
+                "uptakes": "Per-resource uptake rates uₐ (`map[float]`, ≥ 0); set exchange lower bounds, capped by "
+                "supply. Also the Step's trigger.",
+                "substrates": "Current substrate pools (`map[concentration]`); cap each uptake at what the pool can "
+                "supply over the step. A pool at or below 0 supplies nothing.",
                 "biomass": "Current biomass (`mass`); scales fluxes and growth into absolute deltas.",
                 "interval": "Timestep Δt (`float`) emitted by the upstream temporal Process; deltas are zero when Δt ≤ 0.",
             },
             outputs={
-                "substrates": "Per-resource substrate deltas Δsubstrateₐ (`map[count]`), clamped to not exceed the available pool.",
+                "substrates": "Per-resource substrate deltas Δsubstrateₐ (`map[count]`); no uptake exceeds the "
+                "available pool.",
                 "biomass": "Biomass delta Δbiomass = μ·biomass·Δt (`mass`).",
             },
             config={
@@ -271,7 +280,10 @@ class FBAStep(Step):
                 "Starvation: an LP infeasible at the given uptakes but feasible with every tracked exchange opened to "
                 "COBRApy's default bound is supply-limited (e.g. the uptake cannot meet ATPM once a substrate runs out); "
                 "the step returns zero deltas (no growth, no consumption) instead of raising.",
-                "Uptake rates set only exchange lower bounds (lb = -u); substrate deltas are clamped so pools never go negative.",
+                "Uptake rates set only exchange lower bounds (lb = -u), each capped at poolₐ/(biomass·Δt), so growth "
+                "matches the substrate a pool can supply and no uptake draws a pool below 0. A pool already below 0 "
+                "stays where it is. Two consumers of one pool are each capped by the whole pool, so between them "
+                "they can overdraw it.",
                 "Fluxes and growth are constant over the interval Δt (explicit forward-Euler integration of dynamic FBA).",
             ],
         )
@@ -320,10 +332,12 @@ class DynamicFBAProcess(Process):
     """Dynamic FBA as one temporal Process: Michaelis-Menten uptake, then the FBA solve, each interval.
 
     Each step it turns the current substrate concentrations into uptake rates
-    (``mm_uptake_rates``), sets them as exchange lower bounds, solves the FBA LP
-    and returns the biomass and substrate deltas over its own interval: the same
-    numbers the ``MichaelisMentenUptakeProcess`` -> ``FBAStep`` composite computes,
-    with the same clamping and starvation behaviour (see ``FBAStep``).
+    (``mm_uptake_rates``) and hands them to ``fba_deltas``, which caps each at
+    what its pool can supply, sets them as exchange lower bounds, solves the FBA
+    LP and returns the biomass and substrate deltas over the Process's own
+    interval: the same numbers the ``MichaelisMentenUptakeProcess`` -> ``FBAStep``
+    composite computes, with the same cap and starvation behaviour (see
+    ``FBAStep``).
 
     The two components differ in when their deltas apply. A Process's update is
     applied once per interval. A Step's is applied every time it fires, and a
@@ -337,9 +351,10 @@ class DynamicFBAProcess(Process):
 
     description = (
         "Dynamic FBA as one temporal Process: each interval, Michaelis-Menten uptake rates "
-        "Vₐ = Vmaxₐ·Sₐ/(Kmₐ+Sₐ) set the exchange lower bounds, COBRApy solves the FBA LP, and the growth "
-        "rate and exchange fluxes are integrated over the interval into biomass and substrate deltas.\n"
-        "   Δbiomass = μ·biomass·Δt;   Δsubstrateₐ = vₐ·biomass·Δt (clamped ≥ -pool)."
+        "Vₐ = Vmaxₐ·Sₐ/(Kmₐ+Sₐ), each capped at what its pool can supply over the step, set the exchange lower "
+        "bounds, COBRApy solves the FBA LP, and the growth rate and exchange fluxes are integrated over the "
+        "interval into biomass and substrate deltas.\n"
+        "   Δbiomass = μ·biomass·Δt;   Δsubstrateₐ = vₐ·biomass·Δt."
     )
 
     config_schema = {**FBAStep.config_schema, "kinetic_params": "schema"}
