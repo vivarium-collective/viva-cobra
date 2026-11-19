@@ -23,7 +23,9 @@ from viva_cobra.processes.michaelis_menten import MichaelisMentenUptakeProcess
 
 # concentration / mass / count are non-negative scalars (floats); bounds is a
 # per-reaction {lower, upper} exchange-flux window (map[bounds] in configs).
-_TYPE_DEFS = {
+# Public under the name compose-api's runner imports (`viva_cobra.core:standard_types`, the
+# convention pbsim-common and viva-copasi follow), so a run registers these types first.
+standard_types = {
     "concentration": {"_type": "float", "_default": 0.0},
     "mass": {"_type": "float", "_default": 0.0},
     "count": {"_type": "float", "_default": 0.0},
@@ -45,7 +47,7 @@ def _is_registered(core, name: str) -> bool:
 
 def register_types(core):
     """Register viva-cobra's domain types on ``core`` (idempotent)."""
-    for name, schema in _TYPE_DEFS.items():
+    for name, schema in standard_types.items():
         if not _is_registered(core, name):
             core.register_type(name, schema)
     return core
