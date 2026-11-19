@@ -2,6 +2,7 @@
 
 Public API:
 
+    DynamicFBAProcess              dynamic FBA (uptake + COBRApy FBA) as one temporal Process
     FBAStep                        COBRApy FBA as a reactive Step
     MichaelisMentenUptakeProcess   Michaelis-Menten substrate uptake Process
     mm_uptake_rates                the MM kinetics as a plain function
@@ -15,6 +16,7 @@ from viva_cobra.composites.dfba import dfba_document, dfba_spec, run_dfba
 from viva_cobra.core import build_core, register_processes, register_types
 from viva_cobra.models import MODEL_REGISTRY, get_model_spec
 from viva_cobra.processes.fba import (
+    DynamicFBAProcess,
     FBAStep,
     apply_uptake_bounds,
 )
@@ -24,6 +26,7 @@ from viva_cobra.processes.michaelis_menten import (
 )
 
 __all__ = [
+    "DynamicFBAProcess",
     "FBAStep",
     "MichaelisMentenUptakeProcess",
     "mm_uptake_rates",
@@ -38,4 +41,4 @@ __all__ = [
     "get_model_spec",
 ]
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"

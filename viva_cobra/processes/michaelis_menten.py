@@ -45,6 +45,19 @@ def mm_uptake_rates(
     return out
 
 
+def kinetic_table(
+    resources: Sequence[str], kinetic_params: Mapping[str, Sequence[float]] | None, owner: str
+) -> Dict[str, tuple]:
+    """``{resource: (Km, Vmax)}`` as floats for every resource (tuples JSON-roundtrip to lists).
+
+    Raises ValueError naming ``owner`` when a resource has no entry.
+    """
+    kp = kinetic_params or {}
+    missing = set(resources) - set(kp)
+    if missing:
+        raise ValueError(f"{owner} missing kinetic_params for: {sorted(missing)}")
+    return {r: (float(kp[r][0]), float(kp[r][1])) for r in resources}
+
 class MichaelisMentenUptakeProcess(Process):
     """Michaelis-Menten (Monod) uptake — Vₐ = Vmaxₐ·Sₐ/(Kmₐ + Sₐ) per resource.
 
@@ -116,16 +129,7 @@ class MichaelisMentenUptakeProcess(Process):
 
     def initialize(self, config):
         self.resources = list(config["resources"])
-        kp = config.get("kinetic_params") or {}
-        missing = set(self.resources) - set(kp)
-        if missing:
-            raise ValueError(
-                f"MichaelisMentenUptakeProcess missing kinetic_params for: {sorted(missing)}"
-            )
-        # Normalize each entry to a (Km, Vmax) float pair (tuples JSON-roundtrip to lists).
-        self.kinetic_params: Dict[str, tuple] = {
-            r: (float(kp[r][0]), float(kp[r][1])) for r in self.resources
-        }
+        self.kinetic_params = kinetic_table(self.resources, config.get("kinetic_params"), type(self).__name__)
 
     def inputs(self):
         return {

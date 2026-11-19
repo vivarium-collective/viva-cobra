@@ -15,6 +15,7 @@ duplicated, inside `CRM_FBA` (`crm_dfba`) and `multiscale-bats` — both can imp
 
 | Component | Kind | Role |
 |---|---|---|
+| `DynamicFBAProcess` | process-bigraph `Process` (temporal) | The whole dFBA step in one Process: Michaelis-Menten uptake from the current concentrations, then the FBA solve, returning substrate + biomass deltas over its own interval. The form compose-api runs (below). |
 | `FBAStep` | process-bigraph `Step` (reactive) | Loads a GEM, sets exchange lower bounds from uptake rates, solves the FBA LP, returns substrate + biomass deltas. |
 | `MichaelisMentenUptakeProcess` | process-bigraph `Process` (temporal) | Turns substrate concentrations into uptake rates `v = Vmax·S/(Km+S)`, and drives the loop's `interval`. |
 | `dfba_spec` / `dfba_document` / `run_dfba` | composite | Wires the two through shared `substrates` / `biomass` / `uptakes` / `interval` stores. |
@@ -55,6 +56,27 @@ history = run_dfba(config, initial_substrates={"glucose": 11.1, "acetate": 0.0},
 Build the composite into a larger model with `dfba_spec(config, dt)` (returns the
 two process specs — you provide the shared stores + an emitter), or use
 `dfba_document(...)` for a complete runnable document.
+
+### One Process instead of the pair
+
+`DynamicFBAProcess` takes the same `config` and is wired to just the
+`substrates` and `biomass` stores. It computes every interval exactly as the
+pair does, but its deltas apply once per interval because it is a Process. A
+Step's deltas apply every time it fires: when it is built on seeded uptakes
+(so `run_dfba`'s first row already shows one interval of growth at t = 0), when
+a wired input changes, or after a save and reload. compose-api refuses Steps
+whose outputs add for that reason, so it runs `DynamicFBAProcess`, not `FBAStep`.
+
+```python
+"dfba": {
+    "_type": "process",
+    "address": "local:viva_cobra.processes.fba.DynamicFBAProcess",
+    "config": config,          # as above, kinetic_params included
+    "interval": 0.05,
+    "inputs":  {"substrates": ["substrates"], "biomass": ["biomass"]},
+    "outputs": {"substrates": ["substrates"], "biomass": ["biomass"]},
+}
+```
 
 ## Install
 

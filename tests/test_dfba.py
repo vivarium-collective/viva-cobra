@@ -150,3 +150,78 @@ def test_infeasible_solve_that_more_substrate_cannot_fix_raises():
                 "interval": 0.05,
             }
         )
+
+
+def _run_process(config, substrates, biomass, *, steps, dt):
+    """Run ``DynamicFBAProcess`` alone on the substrate and biomass stores; return the emitter trajectory."""
+    from process_bigraph import Composite
+    from process_bigraph.emitter import emitter_from_wires, gather_emitter_results
+
+    from viva_cobra.core import build_core
+
+    doc = {
+        "schema": {"substrates": "map[concentration]", "biomass": "mass"},
+        "state": {
+            "substrates": dict(substrates),
+            "biomass": float(biomass),
+            "dfba": {
+                "_type": "process",
+                "address": "local:DynamicFBAProcess",
+                "config": dict(config),
+                "interval": float(dt),
+                "inputs": {"substrates": ["substrates"], "biomass": ["biomass"]},
+                "outputs": {"substrates": ["substrates"], "biomass": ["biomass"]},
+            },
+            "emitter": emitter_from_wires(
+                {"global_time": ["global_time"], "biomass": ["biomass"], "substrates": ["substrates"]}
+            ),
+        },
+    }
+    composite = Composite(doc, core=build_core())
+    composite.run(steps * dt)
+    return gather_emitter_results(composite)[("emitter",)]
+
+
+def test_process_integrates_as_the_step_composite_does_but_from_the_initial_state():
+    """DynamicFBAProcess computes each interval exactly as the MichaelisMentenUptakeProcess -> FBAStep composite does,
+    through glucose exhaustion (step 114) and the starved steps after it. The two differ only at the start. The
+    composite's Step fires once when the composite is built, on the seeded uptakes, so it has already grown by one
+    interval at t = 0; the Process grows only as time passes, so its first row is the initial state."""
+    substrates, biomass = {"glucose": 11.1, "acetate": 0.0}, 0.01
+    composite = run_dfba(CONFIG, initial_substrates=substrates, initial_biomass=biomass, steps=140, dt=0.05)
+    process = _run_process(CONFIG, substrates, biomass, steps=140, dt=0.05)
+
+    def states(rows):
+        return [(row["biomass"], row["substrates"]) for row in rows]
+
+    assert states(process[:1]) == [(biomass, substrates)]
+    assert composite[0]["biomass"] > biomass  # the Step's extra interval, applied before any time has passed
+    assert states(process[1:]) == states(composite[:-1])
+
+
+def test_one_interval_grows_at_cobrapys_textbook_optimum():
+    """With Km 0 the uptake is Vmax at any positive concentration, so one interval of 1.0 from biomass 1.0 sets the
+    glucose exchange to -10, COBRApy's default for the textbook model: biomass grows by that model's own optimum and
+    glucose falls by 10."""
+    import cobra
+
+    optimum = cobra.io.load_model("textbook").slim_optimize()
+    config = {
+        "model_file": "textbook",
+        "substrate_update_reactions": {"glucose": "EX_glc__D_e"},
+        "bounds": {},
+        "kinetic_params": {"glucose": [0.0, 10.0]},
+    }
+    rows = _run_process(config, {"glucose": 100.0}, 1.0, steps=1, dt=1.0)
+    assert rows[-1]["global_time"] == 1.0
+    assert rows[-1]["biomass"] == pytest.approx(1.0 + optimum, rel=1e-12)
+    assert rows[-1]["substrates"]["glucose"] == pytest.approx(90.0, rel=1e-12)
+
+
+def test_process_requires_kinetic_params_for_every_resource():
+    from viva_cobra.core import build_core
+    from viva_cobra.processes.fba import DynamicFBAProcess
+
+    config = {**CONFIG, "kinetic_params": {"glucose": [0.5, 10.0]}}
+    with pytest.raises(ValueError, match=r"DynamicFBAProcess missing kinetic_params for: \['acetate'\]"):
+        DynamicFBAProcess(config=config, core=build_core())

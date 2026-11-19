@@ -25,11 +25,13 @@ import logging
 import os
 import warnings
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Mapping
 
 import cobra
 from cobra.io import load_model
-from process_bigraph import Step
+from process_bigraph import Process, Step
+
+from viva_cobra.processes.michaelis_menten import kinetic_table, mm_uptake_rates
 
 try:  # contract metadata is optional — never break import if unavailable
     from bigraph_schema.contract import ProcessContract
@@ -83,7 +85,7 @@ def _apply_bounds(model, bounds):
     return model
 
 
-def apply_uptake_bounds(model, uptakes: Dict[str, float], substrate_rxns: Dict[str, str]) -> None:
+def apply_uptake_bounds(model, uptakes: Mapping[str, float], substrate_rxns: Mapping[str, str]) -> None:
     """Set exchange lower bounds from uptake rates: ``lower_bound = -uptake``."""
     for resource, rxn_id in substrate_rxns.items():
         u = max(0.0, float(uptakes.get(resource, 0.0)))
@@ -93,6 +95,63 @@ def apply_uptake_bounds(model, uptakes: Dict[str, float], substrate_rxns: Dict[s
             rxn.upper_bound = lb
         rxn.lower_bound = lb
 
+
+def _objective_model(config):
+    """The configured model with its static bounds and, when given, the ``biomass_reaction`` objective."""
+    model = _load_fba_model(model_file=config["model_file"], bounds=config.get("bounds", {}) or {})
+    if config.get("biomass_reaction"):
+        model.objective = config["biomass_reaction"]
+    return model
+
+
+def _feasible_with_open_supply(model, substrate_rxns: Dict[str, str]) -> bool:
+    """Whether the LP is feasible with every tracked exchange opened to COBRApy's default bound, i.e. whether
+    its infeasibility comes from the substrate supply alone. The bound changes are reverted on exit."""
+    open_uptake = -float(cobra.Configuration().lower_bound)
+    with model:
+        apply_uptake_bounds(model, {r: open_uptake for r in substrate_rxns}, substrate_rxns)
+        return model.optimize().status == "optimal"
+
+
+def fba_deltas(
+    model,
+    substrate_rxns: Dict[str, str],
+    uptakes: Mapping[str, float],
+    substrates: Mapping[str, float],
+    biomass: float,
+    interval: float,
+) -> dict:
+    """One dynamic-FBA step: set the exchange bounds from ``uptakes``, solve, and integrate the growth rate and
+    exchange fluxes over ``interval`` into ``{"substrates": {...}, "biomass": float}`` deltas, each substrate's
+    clamped so its pool stays >= 0. A supply-limited (starved) LP gives zero deltas; any other non-optimal LP raises
+    RuntimeError (see ``FBAStep``)."""
+    apply_uptake_bounds(model, uptakes, substrate_rxns)
+    solution = model.optimize()
+
+    delta_subs = {r: 0.0 for r in substrate_rxns}
+    delta_biomass = 0.0
+
+    if solution.status != "optimal":
+        if solution.status == "infeasible" and _feasible_with_open_supply(model, substrate_rxns):
+            logger.debug("FBA starved: uptakes %s cannot meet the model's fixed demands; zero deltas", uptakes)
+            return {"substrates": delta_subs, "biomass": delta_biomass}
+        # Any other non-optimal LP is a defect in the model or its bounds. Returning zero deltas would look like
+        # a step that ran and grew nothing, so fail loudly instead.
+        raise RuntimeError(f"FBA solve not optimal: status {solution.status!r}")
+
+    if interval > 0.0:
+        mu = float(solution.objective_value)
+        delta_biomass = mu * biomass * interval
+
+        for resource, rxn_id in substrate_rxns.items():
+            flux = float(solution.fluxes[rxn_id]) * biomass * interval
+            available = float(substrates.get(resource, 0.0))
+            delta_subs[resource] = max(flux, -available)
+
+    return {
+        "substrates": delta_subs,
+        "biomass": delta_biomass,
+    }
 
 class FBAStep(Step):
     """Steady-state flux-balance analysis as a non-temporal Step.
@@ -200,15 +259,7 @@ class FBAStep(Step):
 
     def initialize(self, config):
         self.substrate_rxns: Dict[str, str] = dict(config["substrate_update_reactions"])
-        self.resources = list(self.substrate_rxns.keys())
-
-        self.model = _load_fba_model(
-            model_file=config["model_file"],
-            bounds=config.get("bounds", {}) or {},
-        )
-        biomass_rxn = config.get("biomass_reaction")
-        if biomass_rxn:
-            self.model.objective = biomass_rxn
+        self.model = _objective_model(config)
 
     def inputs(self):
         return {
@@ -228,43 +279,69 @@ class FBAStep(Step):
         }
 
     def update(self, state):
-        uptakes = state.get("uptakes", {}) or {}
-        substrates = state.get("substrates", {}) or {}
-        biomass = float(state.get("biomass", 0.0))
-        interval = float(state.get("interval", 0.0))
+        return fba_deltas(
+            self.model,
+            self.substrate_rxns,
+            state.get("uptakes", {}) or {},
+            state.get("substrates", {}) or {},
+            float(state.get("biomass", 0.0)),
+            float(state.get("interval", 0.0)),
+        )
 
-        apply_uptake_bounds(self.model, uptakes, self.substrate_rxns)
-        solution = self.model.optimize()
 
-        delta_subs = {r: 0.0 for r in self.resources}
-        delta_biomass = 0.0
+class DynamicFBAProcess(Process):
+    """Dynamic FBA as one temporal Process: Michaelis-Menten uptake, then the FBA solve, each interval.
 
-        if solution.status != "optimal":
-            if solution.status == "infeasible" and self._feasible_with_open_supply():
-                logger.debug("FBA starved: uptakes %s cannot meet the model's fixed demands; zero deltas", uptakes)
-                return {"substrates": delta_subs, "biomass": delta_biomass}
-            # Any other non-optimal LP is a defect in the model or its bounds. Returning zero deltas would look like
-            # a step that ran and grew nothing, so fail loudly instead.
-            raise RuntimeError(f"FBA solve not optimal: status {solution.status!r}")
+    Each step it turns the current substrate concentrations into uptake rates
+    (``mm_uptake_rates``), sets them as exchange lower bounds, solves the FBA LP
+    and returns the biomass and substrate deltas over its own interval: the same
+    numbers the ``MichaelisMentenUptakeProcess`` -> ``FBAStep`` composite computes,
+    with the same clamping and starvation behaviour (see ``FBAStep``).
 
-        if interval > 0.0:
-            mu = float(solution.objective_value)
-            delta_biomass = mu * biomass * interval
+    The two components differ in when their deltas apply. A Process's update is
+    applied once per interval. A Step's is applied every time it fires, and a
+    Step fires again when a wired input changes or a run is saved and loaded,
+    which applies its deltas twice. compose-api therefore runs this class and
+    refuses ``FBAStep``. It has the shape of spatio-flux's ``DynamicFBA``.
 
-            for resource, rxn_id in self.substrate_rxns.items():
-                flux = float(solution.fluxes[rxn_id]) * biomass * interval
-                available = float(substrates.get(resource, 0.0))
-                delta_subs[resource] = max(flux, -available)
+    config: ``FBAStep``'s, plus
+        kinetic_params: {resource: [Km, Vmax]} for every tracked resource.
+    """
 
+    description = (
+        "Dynamic FBA as one temporal Process: each interval, Michaelis-Menten uptake rates "
+        "Vₐ = Vmaxₐ·Sₐ/(Kmₐ+Sₐ) set the exchange lower bounds, COBRApy solves the FBA LP, and the growth "
+        "rate and exchange fluxes are integrated over the interval into biomass and substrate deltas.\n"
+        "   Δbiomass = μ·biomass·Δt;   Δsubstrateₐ = vₐ·biomass·Δt (clamped ≥ -pool)."
+    )
+
+    config_schema = {**FBAStep.config_schema, "kinetic_params": "schema"}
+
+    def initialize(self, config):
+        self.substrate_rxns: Dict[str, str] = dict(config["substrate_update_reactions"])
+        self.resources = list(self.substrate_rxns)
+        self.kinetic_params = kinetic_table(self.resources, config.get("kinetic_params"), type(self).__name__)
+        self.model = _objective_model(config)
+
+    def inputs(self):
         return {
-            "substrates": delta_subs,
-            "biomass": delta_biomass,
+            "substrates": "map[concentration]",
+            "biomass": "mass",
         }
 
-    def _feasible_with_open_supply(self) -> bool:
-        """Whether the LP is feasible with every tracked exchange opened to COBRApy's default bound, i.e. whether
-        its infeasibility comes from the substrate supply alone. The bound changes are reverted on exit."""
-        open_uptake = -float(cobra.Configuration().lower_bound)
-        with self.model:
-            apply_uptake_bounds(self.model, {r: open_uptake for r in self.resources}, self.substrate_rxns)
-            return self.model.optimize().status == "optimal"
+    def outputs(self):
+        return {
+            "substrates": "map[count]",
+            "biomass": "mass",
+        }
+
+    def update(self, state, interval):
+        substrates = state.get("substrates", {}) or {}
+        return fba_deltas(
+            self.model,
+            self.substrate_rxns,
+            mm_uptake_rates(substrates, self.kinetic_params, self.resources),
+            substrates,
+            float(state.get("biomass", 0.0)),
+            float(interval),
+        )
