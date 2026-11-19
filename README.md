@@ -15,6 +15,7 @@ duplicated, inside `CRM_FBA` (`crm_dfba`) and `multiscale-bats` — both can imp
 
 | Component | Kind | Role |
 |---|---|---|
+| `DynamicFBAProcess` | process-bigraph `Process` (temporal) | The whole dFBA step in one Process: Michaelis-Menten uptake from the current concentrations, then the FBA solve, returning substrate + biomass deltas over its own interval. The form compose-api runs (below). |
 | `FBAStep` | process-bigraph `Step` (reactive) | Loads a GEM, sets exchange lower bounds from uptake rates, solves the FBA LP, returns substrate + biomass deltas. |
 | `MichaelisMentenUptakeProcess` | process-bigraph `Process` (temporal) | Turns substrate concentrations into uptake rates `v = Vmax·S/(Km+S)`, and drives the loop's `interval`. |
 | `dfba_spec` / `dfba_document` / `run_dfba` | composite | Wires the two through shared `substrates` / `biomass` / `uptakes` / `interval` stores. |
@@ -27,11 +28,18 @@ Each scheduled step of `dt`:
 
 ```
 uptake u_a = Vmax_a · S_a / (Km_a + S_a)      (Michaelis-Menten, per resource)
+u_a <- min(u_a, max(0, S_a) / (biomass · dt))  (no more than the pool can supply this step)
 exchange lower_bound  = -u_a                   (FBA constraint)
 solve FBA  ->  growth rate mu, realized fluxes v_a
 delta_biomass    = mu · biomass · dt
-delta_substrate  = v_a · biomass · dt          (clamped to the available pool)
+delta_substrate  = v_a · biomass · dt          (no uptake takes a pool below zero)
 ```
+
+The cap means growth matches the substrate actually consumed. A pool at or below
+zero supplies nothing. Each consumer is capped by the whole pool, so two
+consumers of one shared pool can still overdraw it between them; keeping a
+shared pool non-negative needs a store type that clamps when updates are applied.
+`Km` and `Vmax` must be finite and non-negative.
 
 ## Quickstart
 
@@ -55,6 +63,27 @@ history = run_dfba(config, initial_substrates={"glucose": 11.1, "acetate": 0.0},
 Build the composite into a larger model with `dfba_spec(config, dt)` (returns the
 two process specs — you provide the shared stores + an emitter), or use
 `dfba_document(...)` for a complete runnable document.
+
+### One Process instead of the pair
+
+`DynamicFBAProcess` takes the same `config` and is wired to just the
+`substrates` and `biomass` stores. It computes every interval exactly as the
+pair does, but its deltas apply once per interval because it is a Process. A
+Step's deltas apply every time it fires: when it is built on seeded uptakes
+(so `run_dfba`'s first row already shows one interval of growth at t = 0), when
+a wired input changes, or after a save and reload. compose-api refuses Steps
+whose outputs add for that reason, so it runs `DynamicFBAProcess`, not `FBAStep`.
+
+```python
+"dfba": {
+    "_type": "process",
+    "address": "local:viva_cobra.processes.fba.DynamicFBAProcess",
+    "config": config,          # as above, kinetic_params included
+    "interval": 0.05,
+    "inputs":  {"substrates": ["substrates"], "biomass": ["biomass"]},
+    "outputs": {"substrates": ["substrates"], "biomass": ["biomass"]},
+}
+```
 
 ## Install
 

@@ -14,6 +14,9 @@ spatio-flux / multiscale-bats DynamicFBA.
 """
 from __future__ import annotations
 
+import math
+from collections.abc import Set
+from numbers import Real
 from typing import Dict, Mapping, Sequence
 
 from process_bigraph import Process
@@ -44,6 +47,40 @@ def mm_uptake_rates(
         out[r] = float(Vmax) * S / (float(Km) + S + _EPS)
     return out
 
+
+def kinetic_table(
+    resources: Sequence[str], kinetic_params: Mapping[str, Sequence[float]] | None, owner: str
+) -> Dict[str, tuple]:
+    """``{resource: (Km, Vmax)}`` as floats for every resource (tuples JSON-roundtrip to lists).
+
+    Raises ValueError naming ``owner`` when ``kinetic_params`` is not a mapping, when a resource has no entry, when an
+    entry is not a pair of real numbers (strings and booleans included), or when Km or Vmax is negative or not finite.
+    """
+    kp = {} if kinetic_params is None else kinetic_params
+    if not isinstance(kp, Mapping):
+        raise ValueError(f"{owner} kinetic_params must map each resource to [Km, Vmax], got {kp!r}")
+    missing = set(resources) - set(kp)
+    if missing:
+        raise ValueError(f"{owner} missing kinetic_params for: {sorted(missing)}")
+    table: Dict[str, tuple] = {}
+    for r in resources:
+        entry = kp[r]
+        values = [] if isinstance(entry, (str, bytes, Mapping, Set)) else _items(entry)
+        if len(values) != 2 or not all(isinstance(v, Real) and not isinstance(v, bool) for v in values):
+            raise ValueError(f"{owner} kinetic_params[{r!r}] must be [Km, Vmax], two numbers, got {entry!r}")
+        km, vmax = float(values[0]), float(values[1])
+        if not (math.isfinite(km) and math.isfinite(vmax) and km >= 0.0 and vmax >= 0.0):
+            raise ValueError(f"{owner} kinetic_params[{r!r}] needs finite Km >= 0 and Vmax >= 0, got {entry!r}")
+        table[r] = (km, vmax)
+    return table
+
+
+def _items(entry) -> list:
+    """The items of a list, tuple or 1-D array; none for anything that is not iterable."""
+    try:
+        return list(entry)
+    except TypeError:
+        return []
 
 class MichaelisMentenUptakeProcess(Process):
     """Michaelis-Menten (Monod) uptake — Vₐ = Vmaxₐ·Sₐ/(Kmₐ + Sₐ) per resource.
@@ -116,16 +153,7 @@ class MichaelisMentenUptakeProcess(Process):
 
     def initialize(self, config):
         self.resources = list(config["resources"])
-        kp = config.get("kinetic_params") or {}
-        missing = set(self.resources) - set(kp)
-        if missing:
-            raise ValueError(
-                f"MichaelisMentenUptakeProcess missing kinetic_params for: {sorted(missing)}"
-            )
-        # Normalize each entry to a (Km, Vmax) float pair (tuples JSON-roundtrip to lists).
-        self.kinetic_params: Dict[str, tuple] = {
-            r: (float(kp[r][0]), float(kp[r][1])) for r in self.resources
-        }
+        self.kinetic_params = kinetic_table(self.resources, config.get("kinetic_params"), type(self).__name__)
 
     def inputs(self):
         return {

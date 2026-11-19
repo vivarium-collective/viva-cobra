@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from process_bigraph import allocate_core
 
-from viva_cobra.processes.fba import FBAStep
+from viva_cobra.processes.fba import DynamicFBAProcess, FBAStep
 from viva_cobra.processes.michaelis_menten import MichaelisMentenUptakeProcess
 
 # concentration / mass / count are non-negative scalars (floats); bounds is a
@@ -56,6 +56,7 @@ def register_types(core):
 def register_processes(core):
     """Register viva-cobra's process/step links under friendly names."""
     core.register_link("FBAStep", FBAStep)
+    core.register_link("DynamicFBAProcess", DynamicFBAProcess)
     core.register_link("MichaelisMentenUptakeProcess", MichaelisMentenUptakeProcess)
     return core
 
