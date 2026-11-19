@@ -14,6 +14,7 @@ spatio-flux / multiscale-bats DynamicFBA.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, Mapping, Sequence
 
 from process_bigraph import Process
@@ -56,7 +57,16 @@ def kinetic_table(
     missing = set(resources) - set(kp)
     if missing:
         raise ValueError(f"{owner} missing kinetic_params for: {sorted(missing)}")
-    return {r: (float(kp[r][0]), float(kp[r][1])) for r in resources}
+    table: Dict[str, tuple] = {}
+    for r in resources:
+        try:
+            km, vmax = (float(v) for v in kp[r])
+        except (TypeError, ValueError) as err:
+            raise ValueError(f"{owner} kinetic_params[{r!r}] must be [Km, Vmax], got {kp[r]!r}") from err
+        if not (math.isfinite(km) and math.isfinite(vmax) and km >= 0.0 and vmax >= 0.0):
+            raise ValueError(f"{owner} kinetic_params[{r!r}] needs finite Km >= 0 and Vmax >= 0, got {kp[r]!r}")
+        table[r] = (km, vmax)
+    return table
 
 class MichaelisMentenUptakeProcess(Process):
     """Michaelis-Menten (Monod) uptake — Vₐ = Vmaxₐ·Sₐ/(Kmₐ + Sₐ) per resource.

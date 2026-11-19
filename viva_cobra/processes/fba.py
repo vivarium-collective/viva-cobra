@@ -1,23 +1,28 @@
-"""FBA as a process-bigraph Step.
+"""COBRApy FBA as process-bigraph components: ``DynamicFBAProcess`` and ``FBAStep``.
 
-``FBAStep`` is non-temporal: it consumes per-resource uptake rates (e.g. from a
-Michaelis-Menten uptake Process), plus the current substrate and biomass state,
-solves the FBA LP under uptake-derived exchange bounds with COBRApy, and returns
-deltas for substrates and biomass. The ``interval`` over which those deltas apply
-is read from the input state (emitted by the upstream temporal Process).
+``DynamicFBAProcess`` is temporal: each interval it turns the current substrate
+concentrations into Michaelis-Menten uptake rates, solves the FBA LP and returns
+substrate and biomass deltas over that interval. ``FBAStep`` is non-temporal: it
+consumes uptake rates from an upstream Process and reads the ``interval`` from
+its inputs. Both compute one step with ``fba_deltas``.
 
 Coupling (the dynamic-FBA contract):
 
-    uptake u_a (mmol/gDW/hr, >= 0)  -> exchange lower_bound = -u_a
+    uptake u_a (mmol/gDW/hr, >= 0)  -> capped at pool_a / (biomass * dt)
+                                    -> exchange lower_bound = -u_a
     realized flux v_a               -> delta_substrate = v_a * biomass * dt
     growth rate mu                  -> delta_biomass    = mu  * biomass * dt
 
-Substrate deltas are clamped to the available mass (no negative pools). A step
-whose uptakes are too small to meet the model's fixed demands (e.g. ATPM) is
-starved: it returns zero deltas instead of raising (see ``FBAStep``).
+The cap (spatio-flux's uptake budget) keeps the solve from consuming more than a
+pool holds, so growth matches the substrate actually taken up; a pool at or below
+zero supplies nothing. Each consumer is capped by the whole pool, so two
+consumers of one pool can still overdraw it between them: keeping a shared pool
+non-negative needs a store type that clamps on apply. A step whose uptakes are
+too small to meet the model's fixed demands (e.g. ATPM) is starved: it returns
+zero deltas instead of raising (see ``FBAStep``).
 
-Extracted from CRM_FBA (``crm_dfba/processes/fba.py``); the three module-level
-helpers are framework-agnostic and usable without process-bigraph.
+Extracted from CRM_FBA (``crm_dfba/processes/fba.py``); the module-level helpers
+are framework-agnostic and usable without process-bigraph.
 """
 from __future__ import annotations
 
@@ -113,6 +118,24 @@ def _feasible_with_open_supply(model, substrate_rxns: Dict[str, str]) -> bool:
         return model.optimize().status == "optimal"
 
 
+def supply_limited_uptakes(
+    uptakes: Mapping[str, float],
+    substrates: Mapping[str, float],
+    substrate_rxns: Mapping[str, str],
+    biomass_time: float,
+) -> Dict[str, float]:
+    """Each tracked uptake (>= 0), capped at what its pool can supply over the step: pool / (biomass·Δt), given
+    ``biomass_time`` = biomass·Δt. A pool at or below zero supplies nothing. With no biomass or no time, nothing is
+    consumed, so the uptakes are left uncapped."""
+    capped: Dict[str, float] = {}
+    for resource in substrate_rxns:
+        uptake = max(0.0, float(uptakes.get(resource, 0.0)))
+        if biomass_time > 0.0:
+            uptake = min(uptake, max(0.0, float(substrates.get(resource, 0.0))) / biomass_time)
+        capped[resource] = uptake
+    return capped
+
+
 def fba_deltas(
     model,
     substrate_rxns: Dict[str, str],
@@ -121,10 +144,12 @@ def fba_deltas(
     biomass: float,
     interval: float,
 ) -> dict:
-    """One dynamic-FBA step: set the exchange bounds from ``uptakes``, solve, and integrate the growth rate and
-    exchange fluxes over ``interval`` into ``{"substrates": {...}, "biomass": float}`` deltas, each substrate's
-    clamped so its pool stays >= 0. A supply-limited (starved) LP gives zero deltas; any other non-optimal LP raises
-    RuntimeError (see ``FBAStep``)."""
+    """One dynamic-FBA step: cap each uptake at what its pool can supply over the step, pool / (biomass·Δt), set
+    the exchange bounds, solve, and integrate the growth rate and exchange fluxes over ``interval`` into
+    ``{"substrates": {...}, "biomass": float}`` deltas. A pool at or below zero supplies nothing, and no delta draws a
+    pool below zero. A supply-limited (starved) LP gives zero deltas; any other non-optimal LP raises RuntimeError (see
+    ``FBAStep``)."""
+    uptakes = supply_limited_uptakes(uptakes, substrates, substrate_rxns, biomass * interval)
     apply_uptake_bounds(model, uptakes, substrate_rxns)
     solution = model.optimize()
 
@@ -145,13 +170,14 @@ def fba_deltas(
 
         for resource, rxn_id in substrate_rxns.items():
             flux = float(solution.fluxes[rxn_id]) * biomass * interval
-            available = float(substrates.get(resource, 0.0))
-            delta_subs[resource] = max(flux, -available)
+            available = max(0.0, float(substrates.get(resource, 0.0)))
+            delta_subs[resource] = max(flux, -available)  # the cap makes this hold; this guards rounding
 
     return {
         "substrates": delta_subs,
         "biomass": delta_biomass,
     }
+
 
 class FBAStep(Step):
     """Steady-state flux-balance analysis as a non-temporal Step.
@@ -259,6 +285,7 @@ class FBAStep(Step):
 
     def initialize(self, config):
         self.substrate_rxns: Dict[str, str] = dict(config["substrate_update_reactions"])
+        self.resources = list(self.substrate_rxns)
         self.model = _objective_model(config)
 
     def inputs(self):

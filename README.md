@@ -28,11 +28,18 @@ Each scheduled step of `dt`:
 
 ```
 uptake u_a = Vmax_a · S_a / (Km_a + S_a)      (Michaelis-Menten, per resource)
+u_a <- min(u_a, S_a / (biomass · dt))          (no more than the pool can supply this step)
 exchange lower_bound  = -u_a                   (FBA constraint)
 solve FBA  ->  growth rate mu, realized fluxes v_a
 delta_biomass    = mu · biomass · dt
-delta_substrate  = v_a · biomass · dt          (clamped to the available pool)
+delta_substrate  = v_a · biomass · dt          (never below -S_a)
 ```
+
+The cap means growth matches the substrate actually consumed. A pool at or below
+zero supplies nothing. Each consumer is capped by the whole pool, so two
+consumers of one shared pool can still overdraw it between them; keeping a
+shared pool non-negative needs a store type that clamps when updates are applied.
+`Km` and `Vmax` must be finite and non-negative.
 
 ## Quickstart
 
